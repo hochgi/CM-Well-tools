@@ -1,7 +1,7 @@
 package cmwell.agents.massdelete
 
 import akka.actor.ActorSystem
-import akka.http.scaladsl.model.{HttpMethods, StatusCodes, HttpResponse, HttpRequest}
+import akka.http.scaladsl.model._
 import akka.stream.ActorMaterializer
 import akka.stream.io.Framing
 import akka.stream.scaladsl.{Sink, Source}
@@ -76,7 +76,7 @@ object MassDelete extends App with LazyLogging {
   }
 
   val srcFut = posFut.map(Source.unfoldAsync(_){ pos =>
-    println(s"next position: $pos")
+//    println(s"next position: $pos")
     val req = HttpRequest(uri = s"http://$host:$port$path?op=consume&position=$pos&format=text&length-hint=$lh")
     retry(5, Some(2.seconds)) {
       Http().singleRequest(req).map {
@@ -109,7 +109,7 @@ object MassDelete extends App with LazyLogging {
         .via(Framing.delimiter(endln, 4096))
         .mapAsync(par) { graphPath =>
           val graphStr = graphPath.utf8String
-          println("going to stream graph: " + graphStr)
+//          println("going to stream graph: " + graphStr)
           val uri = s"http://$host:$port/?op=stream&qp=system.quad::http:/$graphStr&format=text&recursive"
           Http().singleRequest(HttpRequest(uri = uri)).flatMap{
             case res@HttpResponse(s,h,e,p) => {
@@ -124,13 +124,16 @@ object MassDelete extends App with LazyLogging {
             }
           }
         }
-        .flatMapMerge(par,identity)
+        .flatMapConcat(identity)
         .via(Framing.delimiter(endln, 4096))
         .filter(_.nonEmpty)
-        .batch(128, bs => {bodyPrefix ++ bs ++ bodySuffix})(_++_)
+        .batch(128, bs => {bodyPrefix ++ bs ++ bodySuffix})(_ ++ bodyPrefix ++ _ ++ bodySuffix)
         .mapAsync(par){ payload =>
-          println("going to ingest payload: " + payload.utf8String)
-          Http().singleRequest(HttpRequest(method = HttpMethods.POST,uri = "http://$host:$port/_in?format=ntriples")).flatMap{
+          Http().singleRequest(
+            HttpRequest(
+              method = HttpMethods.POST,
+              uri = s"http://$host:$port/_in?format=ntriples",
+              entity = HttpEntity.apply(ContentTypes.`text/plain(UTF-8)`,payload))).flatMap{
             case res@HttpResponse(s,h,e,p) => {
               if(s.isSuccess()) Future.successful(e.dataBytes)
               else {
@@ -143,8 +146,8 @@ object MassDelete extends App with LazyLogging {
             }
           }
         }
-        .flatMapMerge(par,identity)
-        .runForeach(println)
+        .flatMapConcat(identity)
+        .runWith(Sink.ignore)
     }
 
     Await.ready(f, Duration.Inf)
