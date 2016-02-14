@@ -1,25 +1,27 @@
 package cmwell.agents.simplereplacegraph
 
 import akka.actor.ActorSystem
+import akka.http.scaladsl._
 import akka.http.scaladsl.model._
 import akka.stream.ActorMaterializer
-import akka.stream.io.Framing
-import akka.stream.scaladsl.{Sink, Source}
+import akka.stream.scaladsl.{Framing, Sink, Source}
 import akka.util.ByteString
 import com.typesafe.scalalogging.LazyLogging
 import org.rogach.scallop.ScallopConf
-import akka.http.scaladsl._
 import scala.concurrent.duration._
 import scala.concurrent.{Future, Await}
 import scala.concurrent.ExecutionContext.Implicits.global
+import scala.util.Success
 
 /**
  * Created by gilad on 1/21/16.
  */
 object Main extends App with LazyLogging {
 
+  logger.info("CM-Well Simple Replace Graph: application started! ")
+
   object Conf extends ScallopConf(args) {
-    version("CM-Well Graph Delete Tool 0.0.1")
+    version("CM-Well Graph Delete Tool " + cmwell.agents.simplereplacegraph.build.Info.buildVersion)
     lazy val parFactor = scala.math.min(sys.runtime.availableProcessors,32)
     val host = opt[String](name = "host", short = 'h', required = true, descr = "CM-Well host to operate on (domain or IP with no port)")
     val port = opt[Int](name = "port", noshort = true, default = Some(80), descr = "CM-Well host's port")
@@ -43,6 +45,8 @@ object Main extends App with LazyLogging {
   implicit val system = ActorSystem("akka-stream-mass-delete")
   implicit val materializer = ActorMaterializer()
 
+  val con = Http().superPool[None.type]()
+
   val posFut: Future[String] = Conf.pos.get match {
     case Some(pos) => Future.successful(pos)
     case None => {
@@ -59,16 +63,16 @@ object Main extends App with LazyLogging {
             h.find(_.name() == "X-CM-WELL-POSITION") match {
               case Some(pos) => pos.value()
               case None => {
-                val msg = s"No position header in response: $res"
-                System.err.println(msg)
-                throw new RuntimeException(msg)
+                val ex = new RuntimeException(s"No position header in response: $res")
+                logger.error("missing initial position",ex)
+                throw ex
               }
             }
           }
           case badRes => {
-            val msg = s"create-consumer failed: $badRes"
-            System.err.println(msg)
-            throw new RuntimeException(msg)
+            val ex = new RuntimeException(s"create-consumer failed: $badRes")
+            logger.error("bad response while retrieving initial position",ex)
+            throw ex
           }
         }
       }
@@ -81,24 +85,24 @@ object Main extends App with LazyLogging {
   val empty = ByteString("")
 
   try {
-    val f = posFut.map(Source.unfoldAsync(_) { pos =>
-      //    println(s"next position: $pos")
+    val f = posFut.flatMap(Source.unfoldAsync(_) { pos =>
+      logger.info(s"next position: $pos")
       val req = HttpRequest(uri = s"http://$host:$port$path?op=consume&position=$pos&format=text&length-hint=$lh")
-      retry(5, Some(2.seconds)) {
-        Http().singleRequest(req).map {
-          case res@HttpResponse(s, h, e, _) if s.isSuccess() => h.find(_.name() == "X-CM-WELL-POSITION") match {
+      retry(20, Some(2.seconds)) {
+        Source.single(req -> None).via(con).runWith(Sink.head).map {
+          case (Success(res@HttpResponse(s, h, e, _)),_) if s.isSuccess() => h.find(_.name() == "X-CM-WELL-POSITION") match {
             case None if s != StatusCodes.NoContent => {
-              val msg = s"No position header in response: $res"
-              System.err.println(msg)
-              throw new RuntimeException(msg)
+              val ex = new RuntimeException(s"No position header in response: $res")
+              logger.error("missing position",ex)
+              throw ex
             }
             case _ if s == StatusCodes.NoContent => None
             case opt => opt.map(_.value() -> e.dataBytes)
           }
           case consumeRes => {
-            val msg = s"Bad response from consume: $consumeRes\nFrom request: $req"
-            System.err.println(msg)
-            throw new RuntimeException(msg)
+            val ex = new RuntimeException(s"Bad response from consume: $consumeRes")
+            logger.error(s"request causing a bad response: $req",ex)
+            throw ex
           }
         }
       }
@@ -108,30 +112,33 @@ object Main extends App with LazyLogging {
       .filter(_.nonEmpty)
       .batch(16, bs => {bodyPrefix ++ bs ++ bodySuffix})(_ ++ bodyPrefix ++ _ ++ bodySuffix)
       .mapAsync(par) { payload =>
-        Http().singleRequest(HttpRequest(
+        logger.trace(s"going to post: \n${payload.utf8String}")
+        val req = HttpRequest(
           method = HttpMethods.POST,
           uri = s"http://$host:$port/_in?format=ntriples",
-          entity = HttpEntity.apply(ContentTypes.`text/plain(UTF-8)`, payload))).flatMap {
-          case res@HttpResponse(s, h, e, p) => {
-            if (s.isSuccess()) Future.successful(e.dataBytes)
-            else {
-              val f = e.dataBytes.runFold(empty)(_ ++ _)
-              f.onComplete { t =>
-                logger.error("bad response received (_in deletes): " + res.toString + s"\nwith payload: ${t.get}")
+          entity = HttpEntity.apply(ContentTypes.`text/plain(UTF-8)`, payload))
+        retry(20, Some(2.seconds)) {
+          Source.single(req -> None).via(con).runWith(Sink.head).flatMap {
+            case (Success(res@HttpResponse(s, h, e, p)), _) => {
+              if (s.isSuccess()) Future.successful(e.dataBytes)
+              else {
+                val f = e.dataBytes.runFold(empty)(_ ++ _)
+                f.onComplete(t => logger.error(s"bad response received (_in deletes): $res\nwith payload: $t"))
+                f.map(Source.single)
               }
-              f.map(_ => Source.empty[ByteString])
             }
           }
         }
       }
       .flatMapConcat(identity)
-      .runWith(Sink.ignore))
+      .runForeach(bs => println(bs.utf8String)))
 
     Await.ready(f, Duration.Inf)
   }
-   finally {
-	println("press ENTER to terminate...")   
-    scala.io.StdIn.readLine()
+  finally {
+    //akka caches connections for 30 seconds by default
+    println("Going down in 30 seconds...")
+    Thread.sleep(30001)
     Await.ready(system.terminate(),Duration.Inf)
     materializer.shutdown()
   }
