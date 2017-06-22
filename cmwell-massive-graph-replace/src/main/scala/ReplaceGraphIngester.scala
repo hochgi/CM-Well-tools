@@ -25,7 +25,7 @@ object ReplaceGraphIngester extends LazyLogging {
   val endln = ByteString("\n")
   lazy val responseNotOK = new Exception("responseNotOK")
 
-  def build(protocol: String, host: String, port: Int, par: Int, lh: Int, token: Option[String], pathToStatements: Map[String, Vector[String]], graphs: Set[String])
+  def build(protocol: String, host: String, port: Int, lh: Int, token: Option[String], pathToStatements: Map[String, Vector[String]], graphs: Set[String])
            (implicit ctx: ExecutionContextExecutor, sys: ActorSystem, mat: Materializer): Future[RunnableGraph[Future[Done]]] = {
 
     val byteStringToStatements: ByteString => Vector[String] = bs => {
@@ -43,7 +43,7 @@ object ReplaceGraphIngester extends LazyLogging {
         .via(Framing.delimiter(endln, 65536))
         .map(byteStringToStatements)
         .batchWeighted(2048, _.length, identity)(_ ++ _)
-        .toMat(ingestStatementsSink(protocol, host, port, par, token)) {
+        .toMat(ingestStatementsSink(protocol, host, port, token)) {
           case (hcp1, (hcp2, fut)) => for {
             _ <- fut
             _ <- hcp1.shutdown()
@@ -53,7 +53,7 @@ object ReplaceGraphIngester extends LazyLogging {
     }
   }
 
-  def ingestStatementsSink(protocol: String, host: String, port: Int, par: Int, token: Option[String])
+  def ingestStatementsSink(protocol: String, host: String, port: Int, token: Option[String])
                           (implicit ctx: ExecutionContext, sys: ActorSystem, mat: Materializer) : Sink[Vector[String],(Http.HostConnectionPool,Future[Done])] = {
     val con = Retry(getConnectionPool[(HttpRequest,Int)](protocol,host,port)){
       case (_, 0) => None
